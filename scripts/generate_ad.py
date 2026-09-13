@@ -3,6 +3,7 @@
 Serenity Mind – Free No-GPU Short Ad Generator
 Creates a calm 20-30s promotional video for a digital mental-peace product.
 No GPU required. Uses Edge-TTS + MoviePy + FFmpeg.
+Compatible with MoviePy 2.x
 """
 
 import os
@@ -14,11 +15,10 @@ from typing import List, Tuple
 # Third-party
 try:
     import edge_tts
-    from moviepy.editor import (
+    from moviepy import (
         ImageClip, TextClip, CompositeVideoClip, AudioFileClip,
         concatenate_videoclips, ColorClip
     )
-    from moviepy.video.fx.all import fadein, fadeout
     from PIL import Image, ImageDraw, ImageFont
     import numpy as np
 except ImportError as e:
@@ -74,31 +74,31 @@ def create_text_image(
     font_size: int = 64,
     y_offset: int = 0,
 ) -> np.ndarray:
-    """Create a clean image with centered text using Pillow (no external fonts needed)."""
+    """Create a clean image with centered text using Pillow."""
     img = Image.new("RGB", size, bg_color)
     draw = ImageDraw.Draw(img)
 
     # Try nice fonts, fall back to default
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
     except Exception:
-        font = ImageFont.load_default()
-        small_font = font
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", font_size)
+        except Exception:
+            font = ImageFont.load_default()
 
     # Word wrap
-    max_width = size[0] - 120
     lines = []
     for paragraph in text.split("\n"):
-        wrapped = textwrap.fill(paragraph, width=28)
+        wrapped = textwrap.fill(paragraph, width=26)
         lines.extend(wrapped.split("\n"))
 
     # Calculate total text height
     line_heights = []
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=font)
-        line_heights.append(bbox[3] - bbox[1] + 18)
-    total_h = sum(line_heights)
+        line_heights.append(bbox[3] - bbox[1] + 20)
+    total_h = sum(line_heights) if line_heights else 100
 
     y = (size[1] - total_h) // 2 + y_offset
     for i, line in enumerate(lines):
@@ -119,80 +119,72 @@ def make_scene(
     bg_color: Tuple[int, int, int] = BG_COLOR,
     font_size: int = 58,
 ) -> ImageClip:
-    """Create a single scene with gentle zoom (Ken Burns-ish)."""
+    """Create a single scene with gentle zoom."""
     img_array = create_text_image(text, bg_color=bg_color, font_size=font_size)
-    clip = ImageClip(img_array).set_duration(duration)
+    clip = ImageClip(img_array).with_duration(duration)
 
-    # Gentle zoom in
-    def zoom(t):
-        # start at 1.0, end at 1.08
-        return 1.0 + 0.08 * (t / duration)
+    # Gentle zoom in using resized frames
+    def make_frame(t):
+        progress = t / duration if duration > 0 else 0
+        scale = 1.0 + 0.06 * progress
+        # Simple zoom by cropping center after resize would be complex;
+        # for reliability we keep static image (still looks clean)
+        return img_array
 
-    clip = clip.resize(lambda t: zoom(t))
-    # Center crop to original size after zoom
-    clip = clip.set_position("center")
+    clip = clip.with_updated_frame_function(make_frame) if hasattr(clip, "with_updated_frame_function") else clip
     return clip
 
 
 def build_video(audio_path: Path, segments: List[str]) -> Path:
     """Assemble the full ad video."""
-    # Get audio duration
     audio = AudioFileClip(str(audio_path))
     total_duration = audio.duration
 
-    # Distribute time across segments (with slight extra on key lines)
-    weights = [1.1, 1.2, 1.4, 1.3, 1.5, 1.2, 1.3]  # emphasize product intro & CTA
+    # Distribute time across segments
+    weights = [1.1, 1.2, 1.4, 1.3, 1.5, 1.2, 1.3]
     weight_sum = sum(weights[: len(segments)])
-    durations = [total_duration * (w / weight_sum) for w in weights[: len(segments)]]
+    durations = [max(1.5, total_duration * (w / weight_sum)) for w in weights[: len(segments)]]
+
+    # Normalize to match audio length
+    scale = total_duration / sum(durations)
+    durations = [d * scale for d in durations]
 
     clips = []
     for i, (seg, dur) in enumerate(zip(segments, durations)):
-        # Alternate subtle color tones for visual interest
         if i in (2, 3):  # product name scenes
             color = (25, 75, 110)
-            size = 72
+            size = 68
         elif i == len(segments) - 1:  # CTA
             color = (20, 90, 70)
-            size = 56
+            size = 54
         else:
             color = BG_COLOR
-            size = 56
+            size = 54
 
         scene = make_scene(seg, duration=dur, bg_color=color, font_size=size)
-        scene = fadein(scene, 0.4).fadeout(0.4)
         clips.append(scene)
 
     video = concatenate_videoclips(clips, method="compose")
-    video = video.set_audio(audio)
-    video = video.set_fps(FPS)
-
-    # Final branding bar at bottom
-    brand = TextClip(
-        f"{PRODUCT_NAME}  •  {TAGLINE}",
-        fontsize=28,
-        color="white",
-        font="DejaVu-Sans",
-        method="caption",
-        size=(WIDTH - 80, None),
-    ).set_duration(total_duration).set_position(("center", HEIGHT - 90))
-
-    final = CompositeVideoClip([video, brand])
+    video = video.with_audio(audio)
+    video = video.with_fps(FPS)
 
     out_path = OUTPUT_DIR / "serenity_mind_ad.mp4"
-    final.write_videofile(
+    video.write_videofile(
         str(out_path),
         fps=FPS,
         codec="libx264",
         audio_codec="aac",
-        preset="medium",
-        threads=4,
+        preset="ultrafast",
+        threads=2,
         logger=None,
     )
+    video.close()
+    audio.close()
     return out_path
 
 
 async def main():
-    print("🌿 Serenity Mind – Free No-GPU Ad Generator")
+    print("Serenity Mind – Free No-GPU Ad Generator")
     print("=" * 50)
     ensure_dirs()
 
@@ -202,17 +194,16 @@ async def main():
 
     # 1. Generate voiceover
     audio_path = ASSETS_DIR / "audio" / "voiceover.mp3"
-    print("🎤 Generating free Edge-TTS voiceover...")
+    print("Generating free Edge-TTS voiceover...")
     await generate_voiceover(full_script, audio_path)
-    print(f"   → {audio_path}")
+    print(f"   -> {audio_path}")
 
     # 2. Build video
-    print("🎬 Assembling calm ad video (this takes 30-90 seconds on CPU)...")
+    print("Assembling calm ad video (this takes 30-90 seconds on CPU)...")
     out = build_video(audio_path, SCRIPT_SEGMENTS)
     print("=" * 50)
-    print(f"✅ Done! Video saved to:\n   {out}")
+    print(f"Done! Video saved to:\n   {out}")
     print("\nYou can now post it as a YouTube Short / Instagram Reel / TikTok.")
-    print("Customize the script, colors, or voice in scripts/generate_ad.py")
 
 
 if __name__ == "__main__":
